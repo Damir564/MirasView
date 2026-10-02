@@ -1,0 +1,20 @@
+{
+  "version": "0.2.1",
+  "defaults": {},
+  "configurations": [
+    {
+      "type": "default",
+      "project": "CMakeLists.txt",
+      "projectTarget": "engine.exe (src\\engine.exe)",
+      "name": "Engine (Editor)",
+      "args": [ "--editor" ]
+    },
+    {
+      "type": "default",
+      "project": "CMakeLists.txt",
+      "projectTarget": "engine.exe (src\\engine.exe)",
+      "name": "Engine (Game)",
+      "args": [ "--game --scene C:\\Projects\\MirasEngine\\out\\build\\x64-release\\src\\parking1.scn" ]
+    }
+  ]
+}
