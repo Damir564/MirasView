@@ -335,6 +335,18 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     gpuModel->name = name;
     gpuModel->sourcePath = path;
     gpuModel->submeshes = mesh.submeshes;
+    gpuModel->materialNames = mesh.materialNames;
+    gpuModel->slotMaterials.resize(mesh.materialNames.size());
+    std::vector<bool> slotSeen(mesh.materialNames.size(), false);
+    for (const SubmeshInfo& sub : mesh.submeshes) {
+        if (sub.materialSlot < 0) {
+            if (!gpuModel->unassignedMaterial) gpuModel->unassignedMaterial = sub.material;
+        }
+        else if (sub.materialSlot < static_cast<int>(slotSeen.size()) && !slotSeen[sub.materialSlot]) {
+            slotSeen[sub.materialSlot] = true;
+            gpuModel->slotMaterials[sub.materialSlot] = sub.material;
+        }
+    }
     gpuModel->drawOrder.resize(mesh.submeshes.size());
     std::iota(gpuModel->drawOrder.begin(), gpuModel->drawOrder.end(), 0u);
     std::stable_sort(gpuModel->drawOrder.begin(), gpuModel->drawOrder.end(), [&](uint32_t a, uint32_t b) {

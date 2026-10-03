@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.hpp>
 #include <vk_mem_alloc.h>
+#include <map>
 #include <memory>
 #include <vector>
 #include <future>
@@ -27,6 +28,11 @@ struct GPUModel {
     std::vector<vk::DescriptorSet> textureDescriptorSets;
 
     std::vector<SubmeshInfo> submeshes;
+    std::vector<std::string> materialNames;
+    // Per slot, the material of its first submesh: what an instance edits from.
+    std::vector<Material> slotMaterials;
+    // Material of the first submesh without a slot; empty when every submesh has one.
+    std::optional<Material> unassignedMaterial;
     // Submesh indices sorted by texture set, so consecutive draws can share one indirect call.
     std::vector<uint32_t> drawOrder;
     size_t vertexCount = 0;
@@ -55,6 +61,15 @@ struct ModelInstance {
     bool visible = true;
     // Multiplied into every submesh's base color.
     glm::vec3 color{ 1.0f };
+    // Per-instance material edits by material slot; slot -1 is a material added to submeshes that have none.
+    std::map<int, MaterialOverride> materials;
+
+    const MaterialOverride* findMaterial(int slot) const {
+        if (materials.empty())
+            return nullptr;
+        const auto it = materials.find(slot);
+        return it == materials.end() ? nullptr : &it->second;
+    }
 
     glm::mat4 getTransformMatrix() const {
         glm::mat4 T = glm::translate(glm::mat4(1.0f), position);

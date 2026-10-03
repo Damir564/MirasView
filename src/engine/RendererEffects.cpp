@@ -194,7 +194,7 @@ void Renderer::recordAoPasses(vk::CommandBuffer cmd, const FrameInput& input)
 void Renderer::recordBloom(vk::CommandBuffer cmd, const FrameInput& input)
 {
     const vk::Rect2D rect = sceneRect(input);
-    const vk::Extent2D fullExtent = m_swapchain.extent();
+    const vk::Extent2D fullExtent = m_targetExtent;
     const auto loadOp = vk::AttachmentLoadOp::eDontCare;
 
     BloomPushConstants push{};

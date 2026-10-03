@@ -4,15 +4,19 @@
 #include <string_view>
 #include <vector>
 #include <fstream>
+#include <map>
 #include <glm/glm.hpp>
 
 // Forward declarations - adjust these includes to match your project
 #include "ModelManager.h" // For ModelManager, ModelInstance, GPUModel
 #include "Log.h"
 
+// Version 1 files have no per-instance color, version 2 no per-instance materials.
+inline constexpr uint32_t kSceneFileVersion = 3;
+
 struct SceneFileHeader {
     char magic[4] = { 'S', 'C', 'N', 'E' };
-    uint32_t version = 2;
+    uint32_t version = kSceneFileVersion;
     uint32_t modelCount = 0;
     uint32_t instanceCount = 0;
 };
@@ -30,11 +34,10 @@ struct SceneInstanceEntry {
     float rotX, rotY, rotZ;
     float scaleX, scaleY, scaleZ;
     bool visible = true;
-    // followed by (version 2+): float color[3]; then: char name[nameLength]
+    // followed by (version 2+): float color[3];
+    // (version 3+): uint32_t materialCount, then per material: int32_t slot, float baseColor[3], metallic, roughness;
+    // then: char name[nameLength]
 };
-
-// Version 1 files have no per-instance color.
-inline constexpr uint32_t kSceneFileVersion = 2;
 
 class SceneSerializer {
 public:
@@ -121,6 +124,15 @@ public:
             file.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
             const float color[3] = { inst.color.r, inst.color.g, inst.color.b };
             file.write(reinterpret_cast<const char*>(color), sizeof(color));
+            const uint32_t materialCount = static_cast<uint32_t>(inst.materials.size());
+            file.write(reinterpret_cast<const char*>(&materialCount), sizeof(materialCount));
+            for (const auto& [slot, material] : inst.materials) {
+                const int32_t slotValue = slot;
+                const float values[5] = { material.baseColor.r, material.baseColor.g, material.baseColor.b,
+                    material.metallic, material.roughness };
+                file.write(reinterpret_cast<const char*>(&slotValue), sizeof(slotValue));
+                file.write(reinterpret_cast<const char*>(values), sizeof(values));
+            }
             file.write(inst.name.data(), entry.nameLength);
         }
 
@@ -143,6 +155,7 @@ public:
             glm::vec3 scale;
             bool visible;
             glm::vec3 color{ 1.0f };
+            std::map<int, MaterialOverride> materials;
         };
 
         std::vector<LoadedModel> models;
@@ -208,6 +221,23 @@ public:
                 float color[3] = { 1.0f, 1.0f, 1.0f };
                 file.read(reinterpret_cast<char*>(color), sizeof(color));
                 scene.instances[i].color = glm::vec3(color[0], color[1], color[2]);
+            }
+            if (header.version >= 3) {
+                uint32_t materialCount = 0;
+                file.read(reinterpret_cast<char*>(&materialCount), sizeof(materialCount));
+                // A corrupt count must not turn into a near-endless read loop.
+                if (!file || materialCount > (1u << 20)) {
+                    LOG_ERROR("[SCENE] Scene file is corrupt: " << filepath << "\n");
+                    return scene;
+                }
+                for (uint32_t m = 0; m < materialCount; ++m) {
+                    int32_t slot = -1;
+                    float values[5] = {};
+                    file.read(reinterpret_cast<char*>(&slot), sizeof(slot));
+                    file.read(reinterpret_cast<char*>(values), sizeof(values));
+                    scene.instances[i].materials[slot] =
+                        MaterialOverride{ glm::vec3(values[0], values[1], values[2]), values[3], values[4] };
+                }
             }
 
             scene.instances[i].name.resize(entry.nameLength);

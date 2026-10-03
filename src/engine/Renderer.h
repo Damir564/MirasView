@@ -58,6 +58,8 @@ struct FrameInput {
     bool showGrid = false;
     ImDrawData* imgui = nullptr;
     float time = 0.0f;
+    // False: only the UI is drawn (over a plain background), e.g. while a video capture owns the scene targets.
+    bool drawScene = true;
 };
 
 // Owns every GPU resource used to draw a frame and records/submits/presents it. The sun, sky and
@@ -108,6 +110,15 @@ public:
     uint32_t framebufferHeight() const { return m_swapchain.extent().height; }
 
     FrameStatus renderFrame(const FrameInput& input);
+
+    // Offscreen capture (video export). beginCapture() resizes the scene targets to width x height until
+    // endCapture(); window frames in between must set FrameInput::drawScene = false. captureFrame() renders
+    // input without UI, waits for the GPU and returns the image as top-down BGRA8 (sRGB encoded).
+    bool beginCapture(uint32_t width, uint32_t height);
+    bool captureFrame(const FrameInput& input, std::vector<uint8_t>& bgra);
+    void endCapture();
+    bool capturing() const { return m_captureActive; }
+    uint32_t maxCaptureDimension() const { return m_maxImageDimension; }
 
 private:
     struct FrameDrawBuffers {
@@ -216,13 +227,18 @@ private:
         std::array<uint64_t, kMaxShadowCascades>& shadowHashes);
     void buildDrawStreams(const FrameInput& input, FrameBatches& batches);
     void buildHighlightStream(const FrameInput& input);
+    // instance supplies the tint and material overrides; null draws the model's own material (shadows, masks).
     void appendDraw(std::vector<DrawRun>& runs, GPUModel* model, const vk::DescriptorSet sets[3], bool blend,
-        const SubmeshInfo& sub, uint32_t transformIndex, const glm::vec3& tint);
-    uint32_t pushDrawData(const SubmeshInfo& sub, uint32_t transformIndex, const glm::vec3& tint);
+        const SubmeshInfo& sub, uint32_t transformIndex, const ModelInstance* instance);
+    uint32_t pushDrawData(const SubmeshInfo& sub, uint32_t transformIndex, const ModelInstance* instance);
     uint32_t pushTransform(const glm::mat4& transform);
     void materialSets(const ModelManager& models, const GPUModel* model, const Material& material,
         vk::DescriptorSet out[3]) const;
     void uploadDrawStreams();
+    // Culling, cascades, frame data and draw streams for the scene in input (current frame slot).
+    void prepareScene(const FrameInput& input);
+    // Every scene pass up to the final one. Returns whether the selection outline has to be drawn.
+    bool recordScene(vk::CommandBuffer cmd, const FrameInput& input);
 
     // Sets every piece of dynamic state the shader-object draws rely on to a known default.
     void setDefaultDrawState(vk::CommandBuffer cmd, vk::SampleCountFlagBits samples,
@@ -242,7 +258,16 @@ private:
     void recordMeshRuns(vk::CommandBuffer cmd, const std::vector<DrawRun>& runs);
     void recordPathLines(vk::CommandBuffer cmd, const FrameInput& input);
     void recordSelectionMask(vk::CommandBuffer cmd, const FrameInput& input);
-    void recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const FrameInput& input, bool drawOutline);
+    // Image the final pass writes, and the layout/usage it is left in afterwards.
+    struct FinalTarget {
+        vk::Image image;
+        vk::ImageView view;
+        vk::Extent2D extent;
+        vk::ImageLayout finalLayout;
+        vk::PipelineStageFlags2 nextStage;
+        vk::AccessFlags2 nextAccess;
+    };
+    void recordFinalPass(vk::CommandBuffer cmd, const FinalTarget& target, const FrameInput& input, bool drawOutline);
     FrameStatus submitAndPresent(vk::CommandBuffer cmd, uint32_t imageIndex);
 
     // ---- RendererEffects.cpp: fullscreen passes ----
@@ -283,8 +308,9 @@ private:
     static constexpr uint32_t kSkyLutMips = 8;
     static constexpr vk::Extent2D kSkyIrradianceExtent{ 32, 16 };
 
-    // Swapchain-sized targets, rebuilt on resize and MSAA changes. With MSAA the multisampled targets
-    // resolve into hdrColor / sceneDepth.
+    // Scene targets, sized m_targetExtent: the swapchain size, or the capture size while capturing. Rebuilt on
+    // resize, MSAA changes and capture begin/end. With MSAA the multisampled targets resolve into hdrColor / sceneDepth.
+    vk::Extent2D m_targetExtent{};
     vk::SampleCountFlagBits m_samples = vk::SampleCountFlagBits::e1;
     RenderImage m_sceneDepth;
     RenderImage m_msaaColor;
@@ -306,6 +332,7 @@ private:
     RenderImage m_skyIrradiance;
     uint64_t m_skyHash = 0;
     bool m_skyValid = false;
+    bool m_renderSky = false; // set by prepareScene() for recordScene()
 
     vk::CommandPool m_commandPool;
     std::vector<vk::CommandBuffer> m_commandBuffers;
@@ -373,6 +400,16 @@ private:
     std::array<vk::VertexInputAttributeDescription2EXT, 4> m_meshAttributes;
 
     LineBuffer m_pathLines;
+
+    // Video capture: the final pass renders into m_captureImage, which is copied into the readback buffer.
+    static constexpr vk::Format kCaptureFormat = vk::Format::eB8G8R8A8Srgb;
+    bool m_captureActive = false;
+    vk::Extent2D m_captureExtent{};
+    RenderImage m_captureImage;
+    VkBuffer m_captureBuffer = VK_NULL_HANDLE;
+    VmaAllocation m_captureAllocation = VK_NULL_HANDLE;
+    void* m_captureMapped = nullptr;
+    uint32_t m_maxImageDimension = 0;
 
     vk::DescriptorPool m_imguiDescriptorPool;
     bool m_imguiInitialized = false;

@@ -238,6 +238,15 @@ void Editor::drawAnimationFileRow()
         rebuildPathLines();
     }
     ImGui::EndDisabled();
+    ImGui::SameLine();
+    const bool canExport = VideoEncoder::supported() && m_cameraAnimator.getPath().keyframes.size() >= 2 &&
+        m_cameraAnimator.getDuration() > 0.0f;
+    ImGui::BeginDisabled(!canExport);
+    if (ImGui::Button("Export Video...")) m_openVideoExportPopup = true;
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip(VideoEncoder::supported()
+        ? "Render the camera path to an .mp4 video (needs at least two keyframes)"
+        : "Video export is only available on Windows");
 }
 
 void Editor::drawAnimationFileDialog()

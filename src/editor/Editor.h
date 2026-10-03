@@ -15,6 +15,7 @@
 #include "engine/IfcScene.h"
 #include "engine/ModelManager.h"
 #include "engine/Renderer.h"
+#include "engine/VideoEncoder.h"
 
 // The scene editor: viewport interaction (picking, gizmo, camera) plus the docked ImGui panels.
 // The implementation is split by panel across the Editor*.cpp files.
@@ -80,6 +81,21 @@ private:
         float depth = 0.0f; // larger = closer to the viewer
     };
 
+    // A running camera-path video export. Frames are rendered offscreen a few per app frame.
+    struct VideoExport {
+        bool active = false;
+        VideoEncoder encoder;
+        std::string path;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t fps = 30;
+        float speed = 1.0f; // path seconds per video second
+        int frame = 0;
+        int frameCount = 0;
+        double startTime = 0.0;
+        std::vector<uint8_t> pixels;
+    };
+
     // Smooth camera turn started from the orientation gizmo.
     struct ViewTurn {
         bool active = false;
@@ -116,6 +132,10 @@ private:
     void validateSelection();
     void clearIfcSelection();
     void selectInstance(int index);
+    bool isInstanceSelected(int index) const;
+    void toggleInstanceSelection(int index);
+    void selectInstanceRange(int index);
+    void deleteSelectedInstances();
     void deselectAll();
     void selectIfcElement(int instanceIndex, IfcScene& scene, const std::string& guid);
     void selectIfcSpatial(int instanceIndex, IfcScene& scene, const std::string& guid);
@@ -198,6 +218,8 @@ private:
     void drawInspector();
     void drawInspectorHeader(ModelInstance& instance, const GPUModel* model);
     void drawTransformSection(int instanceIndex);
+    void drawAppearanceSection(int instanceIndex);
+    void drawMaterialEditor(ModelInstance& instance, const GPUModel& model);
     void drawIfcSelectionDetails();
     const std::unordered_map<std::string, std::string>* drawIfcElementSection(IfcScene& scene);
     const std::unordered_map<std::string, std::string>* drawIfcSpatialSection(IfcScene& scene);
@@ -220,6 +242,15 @@ private:
     void drawAnimationFileDialog();
     bool loadCameraPath();
     void rebuildPathLines();
+
+    // ---- EditorVideoExport.cpp ----
+    bool exportingVideo() const { return m_videoExport.active; }
+    void drawVideoExportPopup();
+    void drawVideoExportProgress();
+    void startVideoExport();
+    void updateVideoExport();
+    void finishVideoExport(bool cancelled, const std::string& error = {});
+    FrameInput videoFrameInput(int frame);
 
     // ---- EditorStatistics.cpp ----
     void drawStatisticsPanel();
@@ -245,6 +276,9 @@ private:
 
     // Selection and tools
     Gizmo m_gizmo;
+    // Instances selected besides m_gizmo.selectedInstance (the primary, which anchors the gizmo).
+    // Translating the primary moves these too. Any non-additive selection clears them.
+    std::vector<int> m_extraSelection;
     GizmoMode m_tool = GizmoMode::Translate;
     IfcSelectionKind m_ifcSelectionKind = IfcSelectionKind::None;
     std::string m_selectedIfcGuid;
@@ -299,6 +333,9 @@ private:
     // Inspector
     ImGuiTextFilter m_propertyFilter;
     SameNameCount m_sameNameCount;
+    // Material slot being edited in the Appearance section, and the instance it was chosen for.
+    int m_materialSlot = -1;
+    int m_materialSlotInstance = -1;
 
     // Camera animation panel
     char m_pathName[128] = "CameraPath1";
@@ -306,6 +343,15 @@ private:
     float m_newKeyframeTime = 0.0f;
     bool m_newKeyframeCurved = true;
     int m_selectedKeyframe = -1;
+
+    // Video export
+    VideoExport m_videoExport;
+    bool m_openVideoExportPopup = false;
+    char m_videoPath[256] = "camera_path.mp4";
+    int m_videoResolution = 1; // index into the presets in EditorVideoExport.cpp
+    int m_videoCustomSize[2] = { 1920, 1080 };
+    int m_videoFps = 30;
+    int m_videoBitrateMbps = 16;
 
     // Statistics panel
     float m_frameTimes[240] = {};

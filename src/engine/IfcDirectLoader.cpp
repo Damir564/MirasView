@@ -1,11 +1,14 @@
 #include "IfcDirectLoader.h"
 #include "Vertex.h"
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -518,6 +521,24 @@ std::vector<std::size_t> appendGroups(std::vector<ColourGroup>& groups, Mesh& re
     return submeshIndices;
 }
 
+// IFC styles have no usable identity once tessellated, so every distinct colour is one material slot.
+void assignColourSlots(Mesh& result)
+{
+    std::map<std::array<float, 4>, int> slots;
+    for (SubmeshInfo& sub : result.submeshes) {
+        const glm::vec4& c = sub.material.baseColorFactor;
+        const auto [it, inserted] = slots.try_emplace({ c.r, c.g, c.b, c.a }, static_cast<int>(slots.size()));
+        if (inserted) {
+            char name[48];
+            snprintf(name, sizeof(name), "Colour #%02X%02X%02X%s", static_cast<int>(std::lround(c.r * 255.0f)),
+                static_cast<int>(std::lround(c.g * 255.0f)), static_cast<int>(std::lround(c.b * 255.0f)),
+                c.a < 0.99f ? " (transparent)" : "");
+            result.materialNames.emplace_back(name);
+        }
+        sub.materialSlot = it->second;
+    }
+}
+
 std::string uniqueGuid(std::string guid, uint32_t id, const auto& existing)
 {
     if (guid.empty() || existing.contains(guid))
@@ -756,5 +777,6 @@ Mesh loadIfcDirect(const std::string& ifcPath)
     std::lock_guard lock(g_webIfcMutex);
     Mesh result;
     runWithLargeStack([&] { result = importIfc(file, ifcPath); });
+    assignColourSlots(result);
     return result;
 }

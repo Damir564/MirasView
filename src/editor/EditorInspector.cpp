@@ -29,18 +29,8 @@ void Editor::drawInspector()
                 drawTransformSection(index);
             // The transform buttons may have deleted or replaced the selection.
             if (hasSelection() && m_gizmo.selectedInstance == index &&
-                ImGui::CollapsingHeader("Appearance", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ModelInstance& current = m_models.getInstances()[index];
-                const ImGuiStyle& style = ImGui::GetStyle();
-                const float extraWidth = ImGui::CalcTextSize("Reset").x + ImGui::CalcTextSize("Color").x +
-                    style.FramePadding.x * 2 + style.ItemSpacing.x + style.ItemInnerSpacing.x;
-                ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - extraWidth, 60.0f));
-                ImGui::ColorEdit3("Color", &current.color.x);
-                ImGui::SetItemTooltip("Color (tint multiplied into the model's base color)");
-                ImGui::SameLine();
-                if (ImGui::Button("Reset")) current.color = glm::vec3(1.0f);
-                ImGui::SetItemTooltip("Reset the color to white");
-            }
+                ImGui::CollapsingHeader("Appearance", ImGuiTreeNodeFlags_DefaultOpen))
+                drawAppearanceSection(index);
             drawIfcSelectionDetails();
         }
     }
@@ -84,6 +74,109 @@ void Editor::drawTransformSection(int instanceIndex)
     const bool deletePressed = ImGui::Button("Delete", ImVec2(buttonWidth, 0));
     ImGui::PopStyleColor();
     if (deletePressed) deleteInstance(instanceIndex);
+}
+
+void Editor::drawAppearanceSection(int instanceIndex)
+{
+    ModelInstance& instance = m_models.getInstances()[instanceIndex];
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float extraWidth = ImGui::CalcTextSize("Reset").x + ImGui::CalcTextSize("Color").x +
+        style.FramePadding.x * 2 + style.ItemSpacing.x + style.ItemInnerSpacing.x;
+    ImGui::SetNextItemWidth(std::max(ImGui::GetContentRegionAvail().x - extraWidth, 60.0f));
+    ImGui::ColorEdit3("Color", &instance.color.x);
+    ImGui::SetItemTooltip("Color (tint multiplied into the model's base color)");
+    ImGui::SameLine();
+    if (ImGui::Button("Reset")) instance.color = glm::vec3(1.0f);
+    ImGui::SetItemTooltip("Reset the color to white");
+
+    if (const GPUModel* model = m_models.getModel(instance.modelIndex)) {
+        ImGui::Spacing();
+        drawMaterialEditor(instance, *model);
+    }
+}
+
+// Material slots come from the model and are shared by its instances, so edits are stored on the
+// instance as overrides. Submeshes the model left without a material are slot -1 and can get one added.
+void Editor::drawMaterialEditor(ModelInstance& instance, const GPUModel& model)
+{
+    const int slotCount = static_cast<int>(model.materialNames.size());
+    const bool hasUnassigned = model.unassignedMaterial.has_value();
+    if (slotCount == 0 && !hasUnassigned)
+        return;
+
+    const int instanceIndex = m_gizmo.selectedInstance;
+    const bool slotValid = m_materialSlot < 0 ? hasUnassigned : m_materialSlot < slotCount;
+    if (m_materialSlotInstance != instanceIndex || !slotValid) {
+        m_materialSlotInstance = instanceIndex;
+        m_materialSlot = slotCount > 0 ? 0 : -1;
+    }
+
+    const auto slotLabel = [&](int slot) {
+        std::string label = slot < 0 ? "(no material)" : model.materialNames[slot];
+        if (instance.findMaterial(slot)) label += slot < 0 ? " (added)" : " (edited)";
+        return label;
+    };
+    const float labelWidth = ImGui::CalcTextSize("Roughness").x + ImGui::GetStyle().ItemInnerSpacing.x;
+    ImGui::PushItemWidth(std::max(ImGui::GetContentRegionAvail().x - labelWidth, 60.0f));
+
+    if (slotCount + (hasUnassigned ? 1 : 0) > 1) {
+        if (ImGui::BeginCombo("Material", slotLabel(m_materialSlot).c_str(), ImGuiComboFlags_HeightLarge)) {
+            const int first = hasUnassigned ? -1 : 0;
+            for (int slot = first; slot < slotCount; ++slot) {
+                ImGui::PushID(slot);
+                const bool selected = slot == m_materialSlot;
+                if (ImGui::Selectable(slotLabel(slot).c_str(), selected)) m_materialSlot = slot;
+                if (selected) ImGui::SetItemDefaultFocus();
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SetItemTooltip("Material slot of this model to edit");
+    }
+    else if (m_materialSlot >= 0) {
+        ImGui::TextDisabled("Material: %s", model.materialNames[m_materialSlot].c_str());
+    }
+
+    const int slot = m_materialSlot;
+    const MaterialOverride* current = instance.findMaterial(slot);
+    const float buttonWidth = ImGui::GetContentRegionAvail().x;
+    if (slot < 0 && !current) {
+        ImGui::TextDisabled("This object has no material.");
+        if (ImGui::Button("Add Material", ImVec2(buttonWidth, 0))) {
+            const Material& base = *model.unassignedMaterial;
+            instance.materials[slot] = MaterialOverride{ glm::vec3(base.baseColorFactor), base.metallicFactor,
+                base.roughnessFactor };
+            setStatus("Added a material to " + instance.name);
+        }
+        ImGui::PopItemWidth();
+        return;
+    }
+
+    MaterialOverride values;
+    if (current) {
+        values = *current;
+    }
+    else {
+        const Material& base = model.slotMaterials[slot];
+        values = { glm::vec3(base.baseColorFactor), base.metallicFactor, base.roughnessFactor };
+    }
+    bool changed = ImGui::ColorEdit3("Base Color", &values.baseColor.x);
+    ImGui::SetItemTooltip("Base color of the material (textures are multiplied by it)");
+    changed |= ImGui::SliderFloat("Metallic", &values.metallic, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    changed |= ImGui::SliderFloat("Roughness", &values.roughness, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    if (changed)
+        instance.materials[slot] = values;
+    ImGui::PopItemWidth();
+
+    if (current || changed) {
+        const char* label = slot < 0 ? "Remove Material" : "Revert to Model Material";
+        if (slot < 0) ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorStyle::kDanger);
+        const bool pressed = ImGui::Button(label, ImVec2(buttonWidth, 0));
+        if (slot < 0) ImGui::PopStyleColor();
+        if (pressed) instance.materials.erase(slot);
+        ImGui::SetItemTooltip(slot < 0 ? "Remove the material added to this object"
+                                       : "Discard this object's changes to the material");
+    }
 }
 
 void Editor::drawIfcSelectionDetails()

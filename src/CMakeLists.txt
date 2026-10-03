@@ -42,6 +42,8 @@
   engine/IfcScene.h
   engine/IfcDirectLoader.h
   engine/IfcDirectLoader.cpp
+  engine/VideoEncoder.h
+  engine/VideoEncoder.cpp
   app/AppMode.h
   app/AppOptions.h
   app/AppOptions.cpp
@@ -58,6 +60,7 @@
   editor/EditorAnimation.cpp
   editor/EditorStatistics.cpp
   editor/EditorGizmo.cpp
+  editor/EditorVideoExport.cpp
   editor/EditorStyle.h
   editor/FileDialog.h
   game/Game.h
@@ -107,5 +110,10 @@ target_link_libraries(engine PRIVATE
     nlohmann_json::nlohmann_json
     web_ifc
 )
+
+# Video export (engine/VideoEncoder.cpp) uses Media Foundation.
+if (WIN32)
+  target_link_libraries(engine PRIVATE mfplat mfreadwrite mfuuid)
+endif()
 
 

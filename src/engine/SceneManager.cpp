@@ -87,6 +87,7 @@ void SceneManager::instantiatePendingScene()
         newInst.scale = inst.scale;
         newInst.visible = inst.visible;
         newInst.color = inst.color;
+        newInst.materials = inst.materials;
     }
 
     m_pendingLoad = false;

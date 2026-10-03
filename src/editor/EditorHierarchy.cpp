@@ -121,7 +121,12 @@ void Editor::drawSceneTree()
     }
     if (actions.duplicateIndex >= 0) duplicateInstance(actions.duplicateIndex);
     if (actions.createCube) addCube();
-    if (actions.deleteIndex >= 0) deleteInstance(actions.deleteIndex);
+    if (actions.deleteIndex >= 0) {
+        if (isInstanceSelected(actions.deleteIndex))
+            deleteSelectedInstances();
+        else
+            deleteInstance(actions.deleteIndex);
+    }
     ImGui::PopStyleVar(2);
 }
 
@@ -165,7 +170,8 @@ void Editor::drawInstanceNode(int instanceIndex, int forceOpenInstance, Hierarch
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
     if (!instance.ifcScene) flags |= ImGuiTreeNodeFlags_Leaf;
-    if (m_gizmo.selectedInstance == instanceIndex && m_ifcSelectionKind == IfcSelectionKind::None)
+    const bool isPrimary = m_gizmo.selectedInstance == instanceIndex;
+    if (isPrimary ? m_ifcSelectionKind == IfcSelectionKind::None : isInstanceSelected(instanceIndex))
         flags |= ImGuiTreeNodeFlags_Selected;
     if (forceOpenInstance == instanceIndex || (matches && !matches->empty()))
         ImGui::SetNextItemOpen(true, ImGuiCond_Always);
@@ -177,8 +183,15 @@ void Editor::drawInstanceNode(int instanceIndex, int forceOpenInstance, Hierarch
     }
 
     const bool open = ImGui::TreeNodeEx("##instance", flags, "%s", instance.name.c_str());
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen())
-        selectInstance(instanceIndex);
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen()) {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.KeyCtrl)
+            toggleInstanceSelection(instanceIndex);
+        else if (io.KeyShift)
+            selectInstanceRange(instanceIndex);
+        else
+            selectInstance(instanceIndex);
+    }
     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
         actions.focusIndex = instanceIndex;
     drawInstanceContextMenu(instanceIndex, actions);

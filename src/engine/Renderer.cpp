@@ -142,6 +142,7 @@ void Renderer::queryCapabilities()
     const OptionalDeviceFeatures& features = m_context->features();
     m_capabilities.maxAnisotropy = features.samplerAnisotropy ? limits.maxSamplerAnisotropy : 1.0f;
     m_maxDrawIndirectCount = features.multiDrawIndirect ? limits.maxDrawIndirectCount : 1;
+    m_maxImageDimension = limits.maxImageDimension2D;
 }
 
 vk::SampleCountFlagBits Renderer::effectiveSampleCount() const
@@ -153,7 +154,7 @@ bool Renderer::createRenderImage(vk::Format format, vk::ImageUsageFlags usage, v
     vk::ImageAspectFlags aspect, RenderImage& out, vk::Extent2D extent, uint32_t mipLevels)
 {
     if (extent.width == 0 || extent.height == 0)
-        extent = m_swapchain.extent();
+        extent = m_targetExtent;
 
     vk::ImageCreateInfo imageInfo{};
     imageInfo.imageType = vk::ImageType::e2D;
@@ -211,7 +212,8 @@ void Renderer::destroyRenderImage(RenderImage& image)
 bool Renderer::createRenderTargets()
 {
     m_samples = effectiveSampleCount();
-    const vk::Extent2D extent = m_swapchain.extent();
+    m_targetExtent = m_captureActive ? m_captureExtent : m_swapchain.extent();
+    const vk::Extent2D extent = m_targetExtent;
     m_halfExtent.setWidth((extent.width + 1) / 2);
     m_halfExtent.setHeight((extent.height + 1) / 2);
     const auto depthAspect = vk::ImageAspectFlagBits::eDepth;
@@ -682,6 +684,14 @@ void Renderer::shutdown()
 
     destroyLineBuffer(m_pathLines);
 
+    destroyRenderImage(m_captureImage);
+    if (m_captureBuffer != VK_NULL_HANDLE)
+        vmaDestroyBuffer(m_allocator, m_captureBuffer, m_captureAllocation);
+    m_captureBuffer = VK_NULL_HANDLE;
+    m_captureAllocation = VK_NULL_HANDLE;
+    m_captureMapped = nullptr;
+    m_captureActive = false;
+
     for (ShaderPair* pair : { &m_meshShaders, &m_prepassShaders, &m_shadowShaders, &m_gizmoShaders, &m_skyShaders,
              &m_gridShaders, &m_maskShaders, &m_outlineShaders, &m_aoDepthShaders, &m_aoShaders, &m_aoBlurShaders,
              &m_bloomDownShaders, &m_bloomUpShaders, &m_compositeShaders, &m_fxaaShaders, &m_skyLutShaders,
@@ -883,6 +893,26 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
     // Reset only once we know this frame will be submitted; otherwise the next wait would hang.
     (void)m_device.resetFences(fence);
 
+    if (input.drawScene)
+        prepareScene(input);
+
+    const vk::CommandBuffer cmd = m_commandBuffers[m_currentFrame];
+    (void)cmd.reset();
+    (void)cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+
+    const bool drawOutline = input.drawScene && recordScene(cmd, input);
+    const FinalTarget target{ vk::Image(m_swapchain.images()[imageIndex]), vk::ImageView(m_swapchain.imageViews()[imageIndex]),
+        m_swapchain.extent(), vk::ImageLayout::ePresentSrcKHR, vk::PipelineStageFlagBits2::eBottomOfPipe,
+        vk::AccessFlagBits2::eNone };
+    recordFinalPass(cmd, target, input, drawOutline);
+
+    (void)cmd.end();
+    ++m_frameIndex;
+    return submitAndPresent(cmd, imageIndex);
+}
+
+void Renderer::prepareScene(const FrameInput& input)
+{
     const glm::vec2 depthRange = projectionDepthRange(input.proj);
     computeShadowCascades(input.view, input.proj, depthRange.x, m_settings.shadowDistance, m_sun.direction,
         m_shadowMap.size, std::span(m_cascades.data(), m_shadowMap.layers));
@@ -901,18 +931,17 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
     m_shadowMapValid = true;
 
     const uint64_t sky = skyHash();
-    const bool renderSky = !m_skyValid || sky != m_skyHash;
+    m_renderSky = !m_skyValid || sky != m_skyHash;
     m_skyHash = sky;
     m_skyValid = true;
 
     buildDrawStreams(input, batches);
     uploadDrawStreams();
+}
 
-    const vk::CommandBuffer cmd = m_commandBuffers[m_currentFrame];
-    (void)cmd.reset();
-    (void)cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
-
-    if (renderSky)
+bool Renderer::recordScene(vk::CommandBuffer cmd, const FrameInput& input)
+{
+    if (m_renderSky)
         recordSkyPasses(cmd);
     recordShadowPasses(cmd, *input.models);
 
@@ -928,11 +957,7 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
         recordSelectionMask(cmd, input);
     if (m_settings.bloom)
         recordBloom(cmd, input);
-    recordFinalPass(cmd, imageIndex, input, drawOutline);
-
-    (void)cmd.end();
-    ++m_frameIndex;
-    return submitAndPresent(cmd, imageIndex);
+    return drawOutline;
 }
 
 FrameUBO Renderer::buildFrameUBO(const FrameInput& input) const
@@ -972,7 +997,7 @@ FrameUBO Renderer::buildFrameUBO(const FrameInput& input) const
 
     const vk::Rect2D rect = sceneRect(input);
     frameData.viewport = glm::vec4(rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height);
-    const vk::Extent2D extent = m_swapchain.extent();
+    const vk::Extent2D extent = m_targetExtent;
     frameData.renderSize = glm::vec4(extent.width, extent.height, 1.0f / extent.width, 1.0f / extent.height);
 
     frameData.time = input.time;
@@ -1129,24 +1154,32 @@ uint32_t Renderer::pushTransform(const glm::mat4& transform)
     return static_cast<uint32_t>(m_frameTransforms.size() - 1);
 }
 
-uint32_t Renderer::pushDrawData(const SubmeshInfo& sub, uint32_t transformIndex, const glm::vec3& tint)
+uint32_t Renderer::pushDrawData(const SubmeshInfo& sub, uint32_t transformIndex, const ModelInstance* instance)
 {
     GpuDrawData d{};
-    d.baseColor = sub.material.baseColorFactor * glm::vec4(tint, 1.0f);
-    d.transformIndex = transformIndex;
-    d.alphaMode = static_cast<int32_t>(sub.material.alphaMode);
+    d.baseColor = sub.material.baseColorFactor;
     d.metallic = sub.material.metallicFactor;
     d.roughness = sub.material.roughnessFactor;
+    if (instance) {
+        if (const MaterialOverride* material = instance->findMaterial(sub.materialSlot)) {
+            d.baseColor = glm::vec4(material->baseColor, d.baseColor.a);
+            d.metallic = material->metallic;
+            d.roughness = material->roughness;
+        }
+        d.baseColor *= glm::vec4(instance->color, 1.0f);
+    }
+    d.transformIndex = transformIndex;
+    d.alphaMode = static_cast<int32_t>(sub.material.alphaMode);
     d.alphaCutoff = sub.material.alphaCutoff;
     m_frameDraws.push_back(d);
     return static_cast<uint32_t>(m_frameDraws.size() - 1);
 }
 
 void Renderer::appendDraw(std::vector<DrawRun>& runs, GPUModel* model, const vk::DescriptorSet sets[3], bool blend,
-    const SubmeshInfo& sub, uint32_t transformIndex, const glm::vec3& tint)
+    const SubmeshInfo& sub, uint32_t transformIndex, const ModelInstance* instance)
 {
     const uint32_t commandIndex = static_cast<uint32_t>(m_frameCommands.size());
-    const uint32_t drawIndex = pushDrawData(sub, transformIndex, tint);
+    const uint32_t drawIndex = pushDrawData(sub, transformIndex, instance);
     m_frameCommands.push_back(vk::DrawIndexedIndirectCommand(
         sub.indexCount, 1, sub.indexOffset, static_cast<int32_t>(sub.vertexOffset), drawIndex));
 
@@ -1197,7 +1230,7 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
                 }
                 for (const auto& rd : batch.instances)
                     if (rd.submeshFlags[si] & bit)
-                        appendDraw(m_shadowRuns[c], model, sets, false, sub, rd.transformIndex, glm::vec3(1.0f));
+                        appendDraw(m_shadowRuns[c], model, sets, false, sub, rd.transformIndex, nullptr);
             }
         }
     }
@@ -1211,7 +1244,7 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
             materialSets(models, model, sub.material, sets);
             for (const auto& rd : batch.instances)
                 if (rd.submeshFlags[si] & kVisibleMain)
-                    appendDraw(m_opaqueRuns, model, sets, false, sub, rd.transformIndex, rd.instance->color);
+                    appendDraw(m_opaqueRuns, model, sets, false, sub, rd.transformIndex, rd.instance);
         }
     }
 
@@ -1235,7 +1268,7 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
             materialSets(models, model, sub.material, sets);
             for (const auto& rd : sortedInstances)
                 if (rd.submeshFlags[si] & kVisibleMain)
-                    appendDraw(m_blendRuns, model, sets, true, sub, rd.transformIndex, rd.instance->color);
+                    appendDraw(m_blendRuns, model, sets, true, sub, rd.transformIndex, rd.instance);
         }
     }
 
@@ -1265,7 +1298,7 @@ void Renderer::buildHighlightStream(const FrameInput& input)
     auto add = [&](size_t si) {
         if (si >= model->submeshes.size() || (ifc && !ifc->isSubmeshVisible(si)))
             return;
-        appendDraw(m_highlightRuns, model, noSets, false, model->submeshes[si], transformIndex, glm::vec3(1.0f));
+        appendDraw(m_highlightRuns, model, noSets, false, model->submeshes[si], transformIndex, nullptr);
     };
     if (highlight.wholeInstance) {
         for (size_t si = 0; si < model->submeshes.size(); ++si)
@@ -1350,10 +1383,10 @@ void Renderer::setAdditiveBlending(vk::CommandBuffer cmd) const
     cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
 }
 
-// The editor's scene area in framebuffer pixels (window coordinates are scaled on high-DPI displays).
+// The editor's scene area in render-target pixels (window coordinates are scaled on high-DPI displays).
 vk::Rect2D Renderer::sceneRect(const FrameInput& input) const
 {
-    const vk::Extent2D extent = m_swapchain.extent();
+    const vk::Extent2D extent = m_targetExtent;
     const int32_t fbWidth = static_cast<int32_t>(extent.width);
     const int32_t fbHeight = static_cast<int32_t>(extent.height);
     const ViewRect& view = input.viewport;
@@ -1740,7 +1773,7 @@ void Renderer::recordSelectionMask(vk::CommandBuffer cmd, const FrameInput& inpu
         .setStoreOp(vk::AttachmentStoreOp::eStore)
         .setClearValue(vk::ClearValue(vk::ClearColorValue(std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 0.0f })));
     vk::RenderingInfo renderInfo{};
-    renderInfo.setRenderArea({ {0, 0}, m_swapchain.extent() })
+    renderInfo.setRenderArea({ {0, 0}, m_targetExtent })
         .setLayerCount(1)
         .setColorAttachments(maskAttachment);
     beginRendering(cmd, renderInfo);
@@ -1782,21 +1815,23 @@ void Renderer::recordSelectionMask(vk::CommandBuffer cmd, const FrameInput& inpu
     pipelineBarriers(cmd, { &toSampled, 1 });
 }
 
-// Single-sample pass on the swapchain image: the tone-mapped scene (or its FXAA'd copy), the selection
-// outline, then ImGui.
-void Renderer::recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const FrameInput& input, bool drawOutline)
+// Single-sample pass on the output image (swapchain or capture): the tone-mapped scene (or its FXAA'd copy),
+// the selection outline, then ImGui.
+void Renderer::recordFinalPass(vk::CommandBuffer cmd, const FinalTarget& target, const FrameInput& input, bool drawOutline)
 {
-    const vk::Rect2D rect = sceneRect(input);
-    const vk::Extent2D extent = m_swapchain.extent();
+    // The output covers the scene targets one to one (the swapchain while editing, the capture image while
+    // capturing). Without a scene the targets may have another size, so they are not used at all.
+    const vk::Rect2D rect = input.drawScene ? sceneRect(input) : vk::Rect2D{ { 0, 0 }, target.extent };
+    const vk::Extent2D extent = m_targetExtent;
     const CompositePushConstants composite = compositeConstants();
-    if (m_settings.fxaa) {
+    if (input.drawScene && m_settings.fxaa) {
         beginFxPass(cmd, m_ldrColor.view, rect, vk::AttachmentLoadOp::eDontCare);
         drawFx(cmd, m_compositeShaders, { m_hdrSet, m_bloomSets[0] }, &composite, sizeof(composite));
         cmd.endRendering();
         colorTargetToSampled(cmd, m_ldrColor);
     }
 
-    const vk::Image swapImage(m_swapchain.images()[imageIndex]);
+    const vk::Image swapImage = target.image;
     const vk::ImageMemoryBarrier2 toAttachment = imageBarrier(swapImage, vk::ImageAspectFlagBits::eColor,
         vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eNone,
         vk::PipelineStageFlagBits2::eColorAttachmentOutput,
@@ -1806,19 +1841,22 @@ void Renderer::recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const
 
     // Outside the scene viewport the UI covers everything, so a plain clear is enough there.
     vk::RenderingAttachmentInfo colorAttachment{};
-    colorAttachment.setImageView(m_swapchain.imageViews()[imageIndex])
+    colorAttachment.setImageView(target.view)
         .setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
         .setLoadOp(vk::AttachmentLoadOp::eClear)
         .setStoreOp(vk::AttachmentStoreOp::eStore)
         .setClearValue(vk::ClearValue(vk::ClearColorValue(std::array<float, 4>{ 0.1f, 0.1f, 0.1f, 1.0f })));
     vk::RenderingInfo renderInfo{};
-    renderInfo.setRenderArea({ {0, 0}, extent })
+    renderInfo.setRenderArea({ {0, 0}, target.extent })
         .setLayerCount(1)
         .setColorAttachments(colorAttachment);
     beginRendering(cmd, renderInfo);
     setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(rect), rect);
 
-    if (m_settings.fxaa) {
+    if (!input.drawScene) {
+        // Only the UI: nothing to composite.
+    }
+    else if (m_settings.fxaa) {
         FxaaPushConstants push{};
         push.texel = glm::vec4(1.0f / extent.width, 1.0f / extent.height, 0.0f, 0.0f);
         push.uvClamp = glm::vec4((rect.offset.x + 0.5f) / extent.width, (rect.offset.y + 0.5f) / extent.height,
@@ -1844,11 +1882,10 @@ void Renderer::recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const
         ImGui_ImplVulkan_RenderDrawData(input.imgui, cmd);
     cmd.endRendering();
 
-    const vk::ImageMemoryBarrier2 toPresent = imageBarrier(swapImage, vk::ImageAspectFlagBits::eColor,
+    const vk::ImageMemoryBarrier2 toNextUse = imageBarrier(swapImage, vk::ImageAspectFlagBits::eColor,
         vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
-        vk::PipelineStageFlagBits2::eBottomOfPipe, vk::AccessFlagBits2::eNone,
-        vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::ePresentSrcKHR);
-    pipelineBarriers(cmd, { &toPresent, 1 });
+        target.nextStage, target.nextAccess, vk::ImageLayout::eColorAttachmentOptimal, target.finalLayout);
+    pipelineBarriers(cmd, { &toNextUse, 1 });
 }
 
 Renderer::FrameStatus Renderer::submitAndPresent(vk::CommandBuffer cmd, uint32_t imageIndex)
@@ -1880,4 +1917,118 @@ Renderer::FrameStatus Renderer::submitAndPresent(vk::CommandBuffer cmd, uint32_t
 
     m_currentFrame = (m_currentFrame + 1) % m_framesInFlight;
     return FrameStatus::Rendered;
+}
+
+// ---------------------------------------------------------------------------
+// Video capture
+// ---------------------------------------------------------------------------
+
+bool Renderer::beginCapture(uint32_t width, uint32_t height)
+{
+    if (m_captureActive || width == 0 || height == 0 || width > m_maxImageDimension || height > m_maxImageDimension)
+        return false;
+    (void)m_device.waitIdle();
+
+    const vk::Extent2D extent{ width, height };
+    if (!createRenderImage(kCaptureFormat,
+            vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferSrc,
+            vk::SampleCountFlagBits::e1, vk::ImageAspectFlagBits::eColor, m_captureImage, extent))
+        return false;
+
+    VkBufferCreateInfo bufferInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufferInfo.size = VkDeviceSize(width) * height * 4;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo allocInfo{};
+    // Host-cached memory: the CPU reads every byte of it back.
+    allocInfo.usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
+    allocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &m_captureBuffer, &m_captureAllocation, &info) != VK_SUCCESS) {
+        LOG_ERROR("Failed to create the capture readback buffer\n");
+        destroyRenderImage(m_captureImage);
+        return false;
+    }
+    m_captureMapped = info.pMappedData;
+
+    m_captureActive = true;
+    m_captureExtent = extent;
+    destroyRenderTargets();
+    if (!createRenderTargets()) {
+        LOG_ERROR("Failed to create " << width << "x" << height << " render targets for capture\n");
+        endCapture();
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::captureFrame(const FrameInput& input, std::vector<uint8_t>& bgra)
+{
+    if (!m_captureActive || !input.models)
+        return false;
+    const vk::Fence fence = m_inFlightFences[m_currentFrame];
+    (void)m_device.waitForFences(fence, VK_TRUE, UINT64_MAX);
+    (void)m_device.resetFences(fence);
+
+    prepareScene(input);
+    const vk::CommandBuffer cmd = m_commandBuffers[m_currentFrame];
+    (void)cmd.reset();
+    (void)cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+
+    const bool drawOutline = recordScene(cmd, input);
+    const vk::Image image(m_captureImage.image);
+    const FinalTarget target{ image, m_captureImage.view, m_captureExtent, vk::ImageLayout::eTransferSrcOptimal,
+        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead };
+    recordFinalPass(cmd, target, input, drawOutline);
+
+    const vk::BufferImageCopy region{ 0, 0, 0, { vk::ImageAspectFlagBits::eColor, 0, 0, 1 }, { 0, 0, 0 },
+        { m_captureExtent.width, m_captureExtent.height, 1 } };
+    cmd.copyImageToBuffer(image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(m_captureBuffer), region);
+    vk::BufferMemoryBarrier2 toHost{};
+    toHost.setSrcStageMask(vk::PipelineStageFlagBits2::eCopy)
+        .setSrcAccessMask(vk::AccessFlagBits2::eTransferWrite)
+        .setDstStageMask(vk::PipelineStageFlagBits2::eHost)
+        .setDstAccessMask(vk::AccessFlagBits2::eHostRead)
+        .setBuffer(vk::Buffer(m_captureBuffer))
+        .setSize(VK_WHOLE_SIZE);
+    cmd.pipelineBarrier2(vk::DependencyInfo{}.setBufferMemoryBarriers(toHost));
+    (void)cmd.end();
+    ++m_frameIndex;
+
+    const vk::CommandBufferSubmitInfo cmdInfo{ cmd };
+    vk::SubmitInfo2 submit{};
+    submit.setCommandBufferInfos(cmdInfo);
+    const vk::Result submitResult = m_context->graphicsQueue().submit2(submit, fence);
+    m_currentFrame = (m_currentFrame + 1) % m_framesInFlight;
+    if (submitResult != vk::Result::eSuccess || m_device.waitForFences(fence, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess) {
+        LOG_ERROR("Capture frame submission failed\n");
+        return false;
+    }
+
+    const size_t size = size_t(m_captureExtent.width) * m_captureExtent.height * 4;
+    vmaInvalidateAllocation(m_allocator, m_captureAllocation, 0, VK_WHOLE_SIZE);
+    bgra.resize(size);
+    memcpy(bgra.data(), m_captureMapped, size);
+    return true;
+}
+
+void Renderer::endCapture()
+{
+    if (!m_captureActive && !m_captureImage.image && m_captureBuffer == VK_NULL_HANDLE)
+        return;
+    (void)m_device.waitIdle();
+    destroyRenderImage(m_captureImage);
+    if (m_captureBuffer != VK_NULL_HANDLE)
+        vmaDestroyBuffer(m_allocator, m_captureBuffer, m_captureAllocation);
+    m_captureBuffer = VK_NULL_HANDLE;
+    m_captureAllocation = VK_NULL_HANDLE;
+    m_captureMapped = nullptr;
+
+    const bool wasActive = m_captureActive;
+    m_captureActive = false;
+    if (wasActive) {
+        destroyRenderTargets();
+        if (!createRenderTargets())
+            LOG_ERROR("Failed to restore the render targets after capture\n");
+    }
 }

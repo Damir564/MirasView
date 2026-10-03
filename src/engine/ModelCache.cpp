@@ -11,7 +11,8 @@
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x564B4D44; // "VKMD"
-constexpr uint32_t kCacheVersion = 3;
+// Bump whenever SubmeshInfo's layout changes; it is written verbatim.
+constexpr uint32_t kCacheVersion = 4;
 
 // Written verbatim (including the implicit padding after version), so its layout is part of the file format.
 struct ModelCacheHeader {
@@ -211,6 +212,7 @@ bool save(const std::string& cachePath, const Mesh& mesh) {
         file.write(reinterpret_cast<const char*>(mesh.indices.data()), header.indexCount * sizeof(uint32_t));
     if (header.submeshCount > 0)
         file.write(reinterpret_cast<const char*>(mesh.submeshes.data()), header.submeshCount * sizeof(SubmeshInfo));
+    writeStrings(file, mesh.materialNames);
 
     for (const auto& tex : mesh.textureData) {
         file.write(reinterpret_cast<const char*>(&tex.width), sizeof(int));
@@ -256,6 +258,9 @@ bool load(const std::string& cachePath, Mesh& outMesh) {
         file.read(reinterpret_cast<char*>(outMesh.indices.data()), header.indexCount * sizeof(uint32_t));
     if (header.submeshCount > 0)
         file.read(reinterpret_cast<char*>(outMesh.submeshes.data()), header.submeshCount * sizeof(SubmeshInfo));
+    if (!readStrings(file, outMesh.materialNames)) return false;
+    for (const SubmeshInfo& sub : outMesh.submeshes)
+        if (sub.materialSlot >= static_cast<int>(outMesh.materialNames.size())) return false;
 
     for (TextureData& tex : outMesh.textureData) {
         file.read(reinterpret_cast<char*>(&tex.width), sizeof(int));

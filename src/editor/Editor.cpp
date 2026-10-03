@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include "engine/ModelLoader.h"
 #include "engine/ModelManager.h"
@@ -34,6 +35,9 @@ Editor::Editor(const EngineContext& engine)
 
 void Editor::onEvent(const SDL_Event& event)
 {
+    // The export renders its own camera; the viewport is not interactive meanwhile.
+    if (exportingVideo())
+        return;
     if (m_flyMode || !ImGui::GetIO().WantCaptureKeyboard) {
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
             handleKeyDown(event.key);
@@ -226,11 +230,18 @@ void Editor::dragGizmo(float mouseX, float mouseY)
     const auto snapTo = [](float value, float step) { return step > 0.0f ? std::round(value / step) * step : value; };
 
     switch (m_gizmo.mode) {
-    case GizmoMode::Translate:
+    case GizmoMode::Translate: {
+        const glm::vec3 before = instance.position;
         instance.position = m_gizmo.originalPosition + axisDir * (amount / m_gizmo.pixelsPerUnit);
         if (snap)
             instance.position[axis] = snapTo(instance.position[axis], m_snapTranslate);
+        // The rest of the selection follows the primary by the same offset.
+        const glm::vec3 delta = instance.position - before;
+        for (int extra : m_extraSelection)
+            if (validInstance(extra))
+                m_models.getInstances()[extra].position += delta;
         break;
+    }
     case GizmoMode::Rotate: {
         const float degreesPerPixel = 0.5f;
         float degrees = amount * degreesPerPixel;
@@ -305,6 +316,7 @@ void Editor::update(float dt)
     }
     moveCamera(dt);
     updateViewTurn(dt);
+    updateVideoExport();
 }
 
 void Editor::lateUpdate(float dt)
@@ -342,6 +354,8 @@ void Editor::drawUi()
     if (m_showGraphicsSettings) drawGraphicsSettingsWindow();
     drawFileDialogs();
     drawHelpPopups();
+    drawVideoExportPopup();
+    drawVideoExportProgress();
 }
 
 void Editor::fillFrame(FrameInput& frame)
@@ -354,6 +368,8 @@ void Editor::fillFrame(FrameInput& frame)
     fillHighlight(frame.highlight);
     frame.showPath = !m_flyMode && m_showCameraPath;
     frame.showGrid = !m_flyMode && m_showGrid;
+    // While exporting, the scene targets have the video's size and belong to the export.
+    frame.drawScene = !exportingVideo();
 }
 
 glm::mat4 Editor::sceneProjection() const
@@ -400,7 +416,7 @@ void Editor::collectSpatialSubmeshes(const IfcScene& scene, const std::string& s
 
 void Editor::handleShortcuts()
 {
-    if (ImGui::GetIO().WantTextInput)
+    if (ImGui::GetIO().WantTextInput || exportingVideo())
         return;
     const bool selection = hasSelection();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O)) openSceneDialog();
@@ -408,7 +424,7 @@ void Editor::handleShortcuts()
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S)) saveScene();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_I)) importModelDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D) && selection) duplicateInstance(m_gizmo.selectedInstance);
-    if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && selection) deleteInstance(m_gizmo.selectedInstance);
+    if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && selection) deleteSelectedInstances();
     if (ImGui::IsKeyChordPressed(ImGuiKey_F) && selection) focusOnInstance(m_gizmo.selectedInstance);
     if (ImGui::IsKeyChordPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) deselectAll();
     if (ImGui::IsKeyChordPressed(ImGuiKey_Q)) m_tool = GizmoMode::None;
@@ -490,6 +506,9 @@ void Editor::validateSelection()
 {
     if (!validInstance(m_gizmo.selectedInstance) && m_gizmo.selectedInstance != -1)
         m_gizmo.deselect();
+    std::erase_if(m_extraSelection, [&](int i) { return !validInstance(i); });
+    if (!hasSelection())
+        m_extraSelection.clear();
     if (m_ifcSelectionInstance != -1 &&
         (!validInstance(m_ifcSelectionInstance) || !m_models.getInstances()[m_ifcSelectionInstance].ifcScene)) {
         m_ifcSelectionInstance = -1;
@@ -516,12 +535,72 @@ void Editor::clearIfcSelection()
     m_ifcSelectionKind = IfcSelectionKind::None;
     m_selectedIfcGuid.clear();
     m_ifcSelectionInstance = -1;
+    m_extraSelection.clear();
 }
 
 void Editor::selectInstance(int index)
 {
     clearIfcSelection();
     m_gizmo.select(index);
+}
+
+bool Editor::isInstanceSelected(int index) const
+{
+    return index >= 0 && (index == m_gizmo.selectedInstance ||
+        std::find(m_extraSelection.begin(), m_extraSelection.end(), index) != m_extraSelection.end());
+}
+
+// Ctrl+click: adds the instance (it becomes the primary) or removes it from the selection.
+void Editor::toggleInstanceSelection(int index)
+{
+    if (!validInstance(index))
+        return;
+    std::vector<int> selected = m_extraSelection;
+    if (hasSelection())
+        selected.push_back(m_gizmo.selectedInstance);
+    const auto it = std::find(selected.begin(), selected.end(), index);
+    if (it != selected.end())
+        selected.erase(it);
+    else
+        selected.push_back(index);
+
+    clearIfcSelection();
+    if (selected.empty()) {
+        m_gizmo.deselect();
+        return;
+    }
+    m_gizmo.select(selected.back());
+    selected.pop_back();
+    m_extraSelection = std::move(selected);
+}
+
+// Shift+click: selects every instance between the primary and the clicked one, in hierarchy order.
+void Editor::selectInstanceRange(int index)
+{
+    if (!hasSelection()) {
+        selectInstance(index);
+        return;
+    }
+    const int anchor = m_gizmo.selectedInstance;
+    const int first = std::min(anchor, index);
+    const int last = std::max(anchor, index);
+    clearIfcSelection();
+    for (int i = first; i <= last; ++i)
+        if (i != index)
+            m_extraSelection.push_back(i);
+    m_gizmo.select(index);
+}
+
+void Editor::deleteSelectedInstances()
+{
+    std::vector<int> selected = m_extraSelection;
+    selected.push_back(m_gizmo.selectedInstance);
+    // Highest index first, so earlier removals do not shift the rest.
+    std::sort(selected.begin(), selected.end(), std::greater<int>());
+    for (int index : selected)
+        deleteInstance(index);
+    if (selected.size() > 1)
+        setStatus("Deleted " + std::to_string(selected.size()) + " objects");
 }
 
 void Editor::deselectAll()
@@ -654,6 +733,7 @@ void Editor::duplicateInstance(int index)
     const size_t newIndex = m_models.createInstance(source.modelIndex, source.position + glm::vec3(offset, 0.0f, 0.0f),
         source.rotation, source.scale);
     m_models.getInstances()[newIndex].color = source.color;
+    m_models.getInstances()[newIndex].materials = source.materials;
     selectInstance(static_cast<int>(newIndex));
     setStatus("Duplicated " + source.name);
 }
